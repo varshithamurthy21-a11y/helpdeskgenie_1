@@ -45,6 +45,7 @@ class HelpDeskAgent:
         self.tools = ITSMTools(store, channel=channel)
         self.retriever = KBRetriever(store.kb)
         self.categorizer = TicketCategorizer()
+        self.external_kb = None          # optional MCPKnowledgeSource (see mcp_client.py)
         if not hasattr(store, "conversations"):
             store.conversations = {}
 
@@ -99,6 +100,9 @@ class HelpDeskAgent:
                 return ("I don't have a verified runbook for that part, so I won't guess at a fix; "
                         "the engineer on your ticket will follow up."), [], None
             conv["pending"] = {"type": "ticket_confirm", "query": query}
+            external = self._external_answer(query, user_id)
+            if external:
+                return external + "\n\nIf that doesn't cover it, shall I **log a ticket**? (yes / no)", [], "ticket_confirm"
             return ("I don't have a verified runbook for that, and I won't guess at fixes for company systems. "
                     "Would you like me to **log a ticket** so an engineer can help? (yes / no)"), [], "ticket_confirm"
 
@@ -127,6 +131,24 @@ class HelpDeskAgent:
         if art.get("kind") != "policy":
             text += "\n\n_Still not working? Just say so and I'll log a ticket._"
         return text, [src], None
+
+    def _external_answer(self, query, user_id):
+        """Quote (never rewrite) results from an external knowledge base reached over MCP."""
+        if self.external_kb is None:
+            return None
+        results = self.external_kb.search(query, user_id=user_id)
+        if not results:
+            return None
+        lines = [f"I don't have a verified runbook for that, but I found this in **{self.external_kb.cfg.name}** "
+                 "(quoted as-is; it has not been reviewed by the service desk):"]
+        for r in results:
+            title = r["title"] or "Result"
+            head = f"[{title}]({r['url']})" if r["url"] else f"**{title}**"
+            quote = "\n".join("> " + ln for ln in r["excerpt"].splitlines() if ln.strip())
+            lines.append(f"{head}\n{quote}")
+        self.s.audit("KB_EXTERNAL", user_id, "SUCCESS", f"{len(results)} result(s) from {self.external_kb.label}",
+                     channel=self.channel)
+        return "\n\n".join(lines)
 
     @staticmethod
     def _match_variant(clar, text):

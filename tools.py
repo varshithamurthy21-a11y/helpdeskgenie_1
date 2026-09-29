@@ -59,17 +59,24 @@ class ITSMTools:
 
     # ------------------------------------------------------------ tickets
     def create_ticket(self, user_id, issue_type, description, priority="P3"):
+        source, note = "local", ""
         if self.jira is not None:
-            ticket_id = self.jira.create_issue(user_id, issue_type, description, priority)
+            try:
+                ticket_id = self.jira.create_issue(user_id, issue_type, description, priority)
+                source = getattr(self.jira, "label", "external")
+            except Exception as e:          # external system down: never lose the ticket
+                ticket_id = self.s.next_id("JIRA")
+                self._audit("CREATE_TICKET_EXTERNAL", user_id, "FAILED", f"{e}; saved locally as {ticket_id}")
+                note = " (the ticketing system was unreachable, so it was saved locally and will need syncing)"
         else:
             ticket_id = self.s.next_id("JIRA")
         self.s.tickets.append({
             "ticket_id": ticket_id, "user_id": user_id, "category": issue_type, "priority": priority,
             "status": "Open", "description": description, "created_at": ts(), "updated_at": ts(),
-            "resolution_type": None, "resolution_notes": "",
+            "resolution_type": None, "resolution_notes": "", "source": source,
         })
-        self._audit("CREATE_TICKET", user_id, "SUCCESS", f"Created {ticket_id} [{issue_type}/{priority}]", ticket_id=ticket_id)
-        return _ok(f"🎫 Ticket **{ticket_id}** opened ({issue_type}, {priority}).", ticket_id=ticket_id)
+        self._audit("CREATE_TICKET", user_id, "SUCCESS", f"Created {ticket_id} [{issue_type}/{priority}] via {source}", ticket_id=ticket_id)
+        return _ok(f"🎫 Ticket **{ticket_id}** opened ({issue_type}, {priority}){note}.", ticket_id=ticket_id)
 
     def check_ticket_status(self, user_id, ticket_id=None):
         if ticket_id is None:

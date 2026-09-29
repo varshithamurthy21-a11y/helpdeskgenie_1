@@ -3,27 +3,41 @@
 A Streamlit IT help-desk agent. It answers from verified runbooks, performs self-service fixes only after identity verification, routes access requests to human approvers, and audits every action.
 
 ```
-pip install -r requirements.txt
-streamlit run app.py          # the app
-python -m genie.evaluation    # evaluation report in the terminal
-pytest -q                     # tests
+pip install -r requirements.txt       # app only
+pip install -r requirements-dev.txt   # + tests and optional integrations
+streamlit run app.py                  # the app
+python evaluation.py            # evaluation report in the terminal
+pytest -q                             # tests
 ```
 
-## Project layout
+## Deploy (Streamlit Community Cloud, free)
+
+1. Push this folder to a GitHub repository (`app.py` at the repository root).
+2. Go to https://share.streamlit.io, sign in with GitHub, and click **Create app**.
+3. Choose the repository and branch, set **Main file path** to `app.py`, and click **Deploy**.
+
+`requirements.txt` is kept lean for deployment; test and integration packages live in `requirements-dev.txt`.
+Secrets (for example `ANTHROPIC_API_KEY`) go in the app's **Settings → Secrets**, never in the repository.
+
+> This deployment is a demo: the sidebar shows one-time codes and lets anyone pick a user. Remove the
+> "Demo phone" panel and wire in real SSO before exposing it to real employees.
+
+## Project layout (all files at the top level)
 
 ```
-app.py                 Streamlit UI only (chat, evaluation, admin dashboard, SecOps mailbox, audit trail)
-genie/
-  data.py              KB runbooks, past resolved-ticket summaries, users, seed tickets
-  store.py             in-memory state + hash-chained audit log + SecOps alerts
-  retriever.py         TF-IDF + cosine similarity retrieval with a confidence gate
-  router.py            intent routing: informational / actionable / mixed / needs_approval
-  tools.py             the 7 ITSM tools + OTP verification (all safety rules live here)
-  agent.py             conversation orchestration, clarifying questions, adaptive style
-  categorizer.py       ticket categorisation models + comparison against historical labels
-  evaluation.py        Iteration 3 golden datasets and report
-  analytics.py         admin dashboard metrics, recurring-issue detection
-  integrations.py      real JIRA / Confluence adapters (optional)
+app.py              Streamlit UI (chat, evaluation, admin dashboard, SecOps mailbox, audit trail, MCP connections)
+mcp_server.py       MCP server: HelpDeskGenie's tools for Claude Desktop / any MCP client
+mcp_client.py       MCP client: HelpDeskGenie uses other MCP servers (JIRA, Confluence, ...)
+data.py             KB runbooks, past resolved-ticket summaries, users, seed tickets
+store.py            in-memory state + hash-chained audit log + SecOps alerts
+retriever.py        TF-IDF + cosine similarity retrieval with a confidence gate
+router.py           intent routing: informational / actionable / mixed / needs_approval
+tools.py            the 7 ITSM tools + OTP verification (all safety rules live here)
+agent.py            conversation orchestration, clarifying questions, adaptive style
+categorizer.py      ticket categorisation models + comparison against historical labels
+evaluation.py       Iteration 3 golden datasets and report
+analytics.py        admin dashboard metrics, recurring-issue detection
+integrations.py     direct JIRA / Confluence REST adapters (optional)
 tests/test_genie.py
 ```
 
@@ -61,7 +75,7 @@ Routing splits each message into tool actions plus an optional KB question. For 
 
 SecOps alerts fire on unverified attempts, 3 wrong codes, targeting another user's account, and "override/bypass" language.
 
-### Iteration 3: Evaluation (`🧪 Evaluation` page or `python -m genie.evaluation`)
+### Iteration 3: Evaluation (`🧪 Evaluation` page or `python evaluation.py`)
 * **Retrieval golden set** (32 queries, 8 out-of-scope): top-1, top-3, abstention accuracy, hallucination rate, ungrounded-step rate.
 * **Intent golden set** (32): accuracy, tool-selection accuracy, confusion matrix. The v1 `app.py` rules are scored alongside for comparison.
 * **Auto-remediation false positives**: 11 adversarial conversations (including the v1 `123456` / `verify` bypasses, override pressure, wrong codes, other users' accounts), plus direct tool-call probes (forged, replayed and wrong-action tokens). `unverified_privileged_actions()` also runs on **live** data in the SecOps Mailbox.
@@ -70,6 +84,63 @@ SecOps alerts fire on unverified attempts, 3 wrong codes, targeting another user
 
 ### Stretch: Admin dashboard
 Open vs resolved by category, most common issue types (tickets + self-help answers), auto-remediation success rate vs manual escalation rate, self-service rate, recurring-issue detection (same user and category, ≥2 in 30 days), per-user history, and an approval queue. **Adaptive style**: `auto` infers beginner/standard/expert from the user's vocabulary. Beginners get explanations; experts get a one-line summary.
+
+## MCP (Model Context Protocol)
+
+### 1. AI assistants → HelpDeskGenie (`mcp_server.py`)
+Tools: `search_it_knowledge_base`, `create_ticket`, `check_ticket_status`, `escalate_ticket`, `close_ticket`,
+`request_access`, `start_identity_verification`, `complete_account_action`, `ask_helpdesk`.
+
+**Claude Desktop (local, stdio):** Settings → Developer → Edit Config, add:
+```json
+{
+  "mcpServers": {
+    "helpdeskgenie": {
+      "command": "python",
+      "args": ["C:\\path\\to\\helpdeskgenie\\mcp_server.py"],
+      "env": { "GENIE_USER_ID": "user123" }
+    }
+  }
+}
+```
+Restart Claude Desktop and ask it: *"my VPN keeps disconnecting"* or *"unlock my account"*.
+Demo one-time codes are written to `demo_phone.txt` next to `mcp_server.py`.
+
+**Remote (streamable HTTP), e.g. a free Render web service:**
+* Build command `pip install -r requirements.txt`, start command `python mcp_server.py --http`
+* Environment variable `GENIE_MCP_API_KEYS=<long-random-key>:user123` (comma-separate several `key:user` pairs)
+* Clients connect to `https://<service>.onrender.com/mcp` with header `Authorization: Bearer <long-random-key>`.
+  `/health` is a public health check.
+
+Streamlit Community Cloud can't host this part (it only runs the Streamlit app), so the MCP server runs
+locally or on a host like Render. It keeps its own in-memory data, separate from the Streamlit app.
+
+Safeguards: the user comes from `GENIE_USER_ID` or the API key, never from tool arguments; one-time codes go
+to the user's phone and never appear in a tool result; access requests still need a human approver; every
+call is audited with `channel="mcp"`.
+
+### 2. HelpDeskGenie → other MCP servers (`mcp_client.py`)
+Add to the app's secrets (Streamlit Cloud: **Manage app → Settings → Secrets**; locally `.streamlit/secrets.toml`):
+```toml
+[mcp_servers.jira]
+url = "https://your-mcp-server.example.com/mcp"
+transport = "http"                      # or "sse"
+headers = { Authorization = "Bearer YOUR_TOKEN" }
+
+[mcp_integrations.ticketing]            # tickets are created in the external system
+server = "jira"
+tool = "jira_create_issue"
+args = { project_key = "ITSD", summary = "{summary}", issue_type = "Task", description = "{description}" }
+
+[mcp_integrations.knowledge]            # searched only when the local KB has no verified runbook
+server = "jira"
+tool = "confluence_search"
+args = { query = "{query}" }
+```
+Tool and argument names depend on the MCP server you connect to. The **🔌 MCP Connections** page lists each
+server's tools and lets `admin01` run test calls. If the external system is unreachable, tickets are saved
+locally, flagged for syncing, and nothing is lost. External search results are quoted verbatim with their link
+and labelled as unreviewed, so hallucination control still holds.
 
 ## Caveats to state when presenting
 * The golden datasets are small and were written alongside the code, so the 100% retrieval and intent scores are **in-sample**. Add unseen queries (ideally real user phrasing) before claiming generalisation. The categorisation score is cross-validated, but on synthetic history. Load a real JIRA export with `load_history_csv()`.

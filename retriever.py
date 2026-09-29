@@ -21,6 +21,7 @@ _NORMALISE = [
 ]
 
 MIN_SCORE = 0.15          # below this the agent abstains instead of guessing
+PAST_TICKET_MIN = 0.35    # a past ticket alone (no KB article) needs a stronger match
 AMBIGUITY_RATIO = 0.70    # 2nd-best article within 70% of best -> ask which one
 
 
@@ -58,7 +59,7 @@ class KBRetriever:
         kb = [h for h in hits if not h[0]["id"].startswith("JIRA") and h[1] >= MIN_SCORE]
         if kb:
             return kb[0]
-        return hits[0] if hits and hits[0][1] >= MIN_SCORE else None
+        return hits[0] if hits and hits[0][1] >= PAST_TICKET_MIN else None
 
     def related_past_fix(self, query, exclude_id=None):
         """A resolved-ticket summary relevant to the query, shown as 'related'."""

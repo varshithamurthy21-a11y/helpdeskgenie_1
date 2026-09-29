@@ -2,8 +2,8 @@
 
 Run:  streamlit run app.py
 
-All logic lives in the `genie` package so it can be tested and reused behind
-Slack / Teams bots; this file is only the UI.
+All logic lives in the other modules so it can be tested and reused behind
+Slack / Teams bots or the MCP server (mcp_server.py); this file is only the UI.
 """
 import pandas as pd
 import streamlit as st
@@ -12,6 +12,11 @@ import analytics
 from agent import HelpDeskAgent
 from evaluation import run_all, to_markdown, unverified_privileged_actions
 from store import Store
+
+try:
+    import mcp_client
+except ImportError:                  # `mcp` not installed: app still works, MCP page explains
+    mcp_client = None
 
 st.set_page_config(page_title="HelpDeskGenie", page_icon="🧞", layout="wide")
 
@@ -23,13 +28,21 @@ if "store" not in st.session_state:
     st.session_state.agent = HelpDeskAgent(st.session_state.store)
     st.session_state.chats = {}
     st.session_state.eval_report = None
+    # MCP integrations (optional, configured in secrets)
+    servers, integrations = mcp_client.load_config(st.secrets) if mcp_client else ({}, {})
+    ticket_client, knowledge, problems = (mcp_client.build_integrations(servers, integrations, st.session_state.store)
+                                          if mcp_client else (None, None, []))
+    st.session_state.agent.tools.jira = ticket_client
+    st.session_state.agent.external_kb = knowledge
+    st.session_state.mcp = {"servers": servers, "integrations": integrations, "problems": problems, "tools": {}}
 store = st.session_state.store
 agent = st.session_state.agent
 
 WELCOME = ("Hi, I'm **HelpDeskGenie**. Ask me an IT question (VPN, Wi-Fi, Outlook, drives, printers…), "
            "or ask me to unlock your account, reset your password, raise an access request, or log/check a ticket.")
 
-PAGES = ["💬 HelpDesk Chat", "🧪 Evaluation (Iteration 3)", "📊 Admin Dashboard", "📬 SecOps Mailbox", "🧾 Audit Trail"]
+PAGES = ["💬 HelpDesk Chat", "🧪 Evaluation (Iteration 3)", "📊 Admin Dashboard", "📬 SecOps Mailbox", "🧾 Audit Trail",
+         "🔌 MCP Connections"]
 
 # ---------------------------------------------------------------------------
 # Sidebar
@@ -258,3 +271,105 @@ elif page == PAGES[4]:
     view = df.drop(columns=["prev_hash"]).assign(hash=df["hash"].str[:12], meta=df["meta"].astype(str))
     st.dataframe(view.iloc[::-1])
     st.download_button("⬇ Export CSV", df.to_csv(index=False), "helpdeskgenie_audit.csv", "text/csv")
+
+# ---------------------------------------------------------------------------
+# 🔌 MCP connections
+# ---------------------------------------------------------------------------
+elif page == PAGES[5]:
+    st.title("🔌 MCP Connections")
+    mcp_state = st.session_state.mcp
+    is_admin = store.users[user_id].get("role") == "it_admin"
+
+    t_out, t_in = st.tabs(["HelpDeskGenie → other MCP servers", "AI assistants → HelpDeskGenie (MCP server)"])
+    with t_out:
+        if mcp_client is None:
+            st.error("The `mcp` package is not installed. Add `mcp` to requirements.txt.")
+        st.write("HelpDeskGenie can create tickets and search documentation in your existing systems "
+                 "(JIRA, Confluence, ServiceNow…) through their MCP servers. Configure them in **Secrets**.")
+        integ = mcp_state["integrations"]
+        c1, c2 = st.columns(2)
+        tick, know = integ.get("ticketing"), integ.get("knowledge")
+        c1.metric("Ticketing", f"{tick['server']} / {tick['tool']}" if tick else "local demo")
+        c2.metric("Extra knowledge search", f"{know['server']} / {know['tool']}" if know else "off")
+        for prob in mcp_state["problems"]:
+            st.warning(prob)
+
+        if not mcp_state["servers"]:
+            st.info("No MCP servers configured yet. Add this to the app's secrets (Streamlit Cloud: "
+                    "**Manage app → Settings → Secrets**; locally: `.streamlit/secrets.toml`) and reboot the app:")
+            st.code('''[mcp_servers.jira]
+url = "https://your-mcp-server.example.com/mcp"
+transport = "http"            # or "sse"
+headers = { Authorization = "Bearer YOUR_TOKEN" }
+
+[mcp_integrations.ticketing]
+server = "jira"
+tool = "jira_create_issue"   # check the exact name on this page once connected
+args = { project_key = "ITSD", summary = "{summary}", issue_type = "Task", description = "{description}" }
+
+[mcp_integrations.knowledge]
+server = "jira"
+tool = "confluence_search"
+args = { query = "{query}" }''', language="toml")
+
+        for name, cfg in mcp_state["servers"].items():
+            with st.expander(f"🖧 {name}  ·  {cfg.url}  ({cfg.transport})", expanded=True):
+                if st.button("Connect and list tools", key=f"lt_{name}"):
+                    try:
+                        mcp_state["tools"][name] = mcp_client.list_tools(cfg)
+                        store.audit("MCP_LIST_TOOLS", user_id, "SUCCESS", f"{name}: {len(mcp_state['tools'][name])} tools",
+                                    channel="mcp-client")
+                    except BaseException as e:  # noqa: BLE001
+                        mcp_state["tools"][name] = None
+                        st.error(f"Could not connect: {mcp_client.describe_error(e)}")
+                tools = mcp_state["tools"].get(name)
+                if tools:
+                    st.success(f"Connected: {len(tools)} tools")
+                    st.dataframe(pd.DataFrame([{"tool": t["name"], "description": t["description"][:160],
+                                                "arguments": ", ".join((t["input_schema"] or {}).get("properties", {}))}
+                                               for t in tools]))
+                    if not is_admin:
+                        st.caption("Sign in as **admin01** to run test calls.")
+                    else:
+                        with st.form(f"call_{name}"):
+                            tname = st.selectbox("Tool", [t["name"] for t in tools])
+                            raw = st.text_area("Arguments (JSON)", "{}")
+                            if st.form_submit_button("Run test call"):
+                                try:
+                                    import json
+                                    ok, out = mcp_client.call_tool(cfg, tname, json.loads(raw or "{}"))
+                                    store.audit("MCP_CALL", user_id, "SUCCESS" if ok else "FAILED", f"{name}/{tname} (admin test)",
+                                                channel="mcp-client")
+                                    (st.success if ok else st.error)("Tool returned:" if ok else "Tool reported an error:")
+                                    st.code(out[:4000] or "(empty)", language=None)
+                                except ValueError:
+                                    st.error("Arguments must be valid JSON, e.g. {\"query\": \"vpn\"}")
+                                except BaseException as e:  # noqa: BLE001
+                                    st.error(f"Call failed: {mcp_client.describe_error(e)}")
+
+        recent = [e for e in store.audit_log if e["channel"] in ("mcp-client", "mcp")][-15:]
+        if recent:
+            st.subheader("Recent MCP activity")
+            st.dataframe(pd.DataFrame(recent)[["timestamp", "action", "user_id", "status", "details"]].iloc[::-1])
+
+    with t_in:
+        st.write("`mcp_server.py` in this repository lets Claude Desktop, Claude Code, Cursor or any MCP client use "
+                 "HelpDeskGenie directly: search the knowledge base, create and track tickets, request access, and "
+                 "unlock accounts or reset passwords with a one-time code. It runs as its own process, separate "
+                 "from this Streamlit app.")
+        st.markdown("**Local (Claude Desktop):** add this to `claude_desktop_config.json` and restart Claude Desktop.")
+        st.code('''{
+  "mcpServers": {
+    "helpdeskgenie": {
+      "command": "python",
+      "args": ["C:\\\\path\\\\to\\\\helpdeskgenie\\\\mcp_server.py"],
+      "env": { "GENIE_USER_ID": "user123" }
+    }
+  }
+}''', language="json")
+        st.markdown("**Remote (e.g. Render):** start command `python mcp_server.py --http`, with the environment "
+                    "variable `GENIE_MCP_API_KEYS=<long-random-key>:user123`. Clients connect to "
+                    "`https://<your-service>/mcp` with header `Authorization: Bearer <long-random-key>`.")
+        st.caption("Safeguards: the user is fixed by the server config or API key (never by the AI), one-time codes "
+                   "go to the user's phone and are never shown to the AI, access requests still need a human "
+                   "approver, and every call is audited.")

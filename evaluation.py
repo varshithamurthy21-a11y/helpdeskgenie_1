@@ -62,6 +62,9 @@ RETRIEVAL_GOLDEN = [
     ("patch the domain controller for the latest CVE", None),
     ("my internet is slow", None),
     ("sap basis transport failed in production", None),
+    ("configure bgp on the core router", None),
+    ("reset the router in the server room", None),
+    ("outlook stuck on updating inbox after the mailbox migration", "JIRA-3877"),
 ]
 
 # (query, expected intent class, expected tools)
@@ -371,7 +374,7 @@ def to_markdown(report):
         "# HelpDeskGenie – Evaluation Report", "",
         "## Scores", "",
         "| Suite | Metric | Score |", "|---|---|---|",
-        f"| Retrieval | Top-1 accuracy (in-scope, n={r['n']}) | {pct(r['top1_accuracy'])} |",
+        f"| Retrieval | Top-1 accuracy (in-scope; {r['n']} queries total) | {pct(r['top1_accuracy'])} |",
         f"| Retrieval | Top-3 recall | {pct(r['top3_recall'])} |",
         f"| Retrieval | Correct abstention on out-of-scope | {pct(r['abstention_accuracy'])} |",
         f"| Retrieval | **Hallucination rate** (answered) | {pct(r['hallucination_rate'])} |",

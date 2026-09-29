@@ -4,7 +4,7 @@
 
 | Suite | Metric | Score |
 |---|---|---|
-| Retrieval | Top-1 accuracy (in-scope, n=32) | 100% |
+| Retrieval | Top-1 accuracy (in-scope; 35 queries total) | 100% |
 | Retrieval | Top-3 recall | 100% |
 | Retrieval | Correct abstention on out-of-scope | 100% |
 | Retrieval | **Hallucination rate** (answered) | 0% |
@@ -22,7 +22,7 @@
 |:--------------------|-----------:|-----------:|:-------------|
 | tfidf_logreg        |      0.898 |      0.897 | 5-fold CV    |
 | keyword_rules       |      0.739 |      0.720 | full history |
-| kb_nearest_article  |      0.608 |      0.597 | full history |
+| kb_nearest_article  |      0.597 |      0.584 | full history |
 | baseline_rules (v1) |      0.216 |      0.116 | full history |
 
 ## Failure cases

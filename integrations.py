@@ -2,7 +2,7 @@
 
 The demo runs on in-memory mocks (store.py). To go live, pass real clients:
 
-    from genie.integrations import JiraClient, load_kb_from_confluence
+    from integrations import JiraClient, load_kb_from_confluence
     store = Store()
     store.kb = load_kb_from_confluence(...) + store.kb        # real runbooks
     agent = HelpDeskAgent(store)
