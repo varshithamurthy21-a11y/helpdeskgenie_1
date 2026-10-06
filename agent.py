@@ -46,6 +46,9 @@ class HelpDeskAgent:
         self.retriever = KBRetriever(store.kb)
         self.categorizer = TicketCategorizer()
         self.external_kb = None          # optional MCPKnowledgeSource (see mcp_client.py)
+        self.rag = None                  # optional RAGGenerator (see rag.py); None = quote verified steps
+        self.rag_enabled = True
+        self.last_mode = None            # "rag" | "extractive", for the UI
         if not hasattr(store, "conversations"):
             store.conversations = {}
 
@@ -67,11 +70,46 @@ class HelpDeskAgent:
             return "beginner"
         return "standard"
 
+    @staticmethod
+    def _src(art):
+        if art.get("url"):
+            return art["url"]
+        if art["id"].startswith("JIRA"):
+            return f"https://jira.company.internal/browse/{art['id']}"
+        return f"https://confluence.company.internal/display/ITKB/{art['id']}"
+
+    def _compose(self, art, level, query, user_id, steps=None, heading_note=""):
+        """RAG answer when available and safe, else the verified steps quoted exactly."""
+        self.last_mode = "extractive"
+        if self.rag is not None and self.rag_enabled and not art.get("critical") and art.get("kind") != "policy":
+            from retriever import MIN_SCORE, PAST_TICKET_MIN
+            primary = {"id": art["id"], "title": art["title"], "steps": steps or art["steps"]}
+            context, by_id = [primary], {art["id"]: art}
+            top = self.retriever.search(query, k=6)
+            best = next((sc for a, sc in top if a["id"] == art["id"]), 0) or (top[0][1] if top else 0)
+            for a, sc in top:
+                gate = PAST_TICKET_MIN if a["id"].startswith("JIRA") else MIN_SCORE
+                if a["id"] != art["id"] and not a.get("critical") and sc >= gate and sc >= 0.5 * best and len(context) < 3:
+                    context.append({"id": a["id"], "title": a["title"], "steps": a["steps"]})
+                    by_id[a["id"]] = a
+            res = self.rag.generate(query, context, level)
+            if res.ok:
+                self.last_mode = "rag"
+                links = " · ".join(f"[{i} – {by_id[i]['title']}]({self._src(by_id[i])})" for i in res.sources)
+                self.s.audit("RAG_ANSWER", user_id, "SUCCESS", f"Generated from {', '.join(res.cited)}", channel=self.channel,
+                             meta={"cited": res.cited, "context": [c["id"] for c in context], "model": self.rag.model})
+                text = (f"### ✨ {art['title']}{heading_note}\n{res.text}\n\n🔗 Sources: {links}\n\n"
+                        "_Written by Claude from the verified runbooks above; every step was checked against its source._")
+                return text, self._src(art), res.sources
+            self.s.audit("RAG_FALLBACK", user_id, "INFO", f"Quoted verified steps instead: {res.reason}",
+                         channel=self.channel, meta={"context": [c["id"] for c in context]})
+        text, src = self._format_article(art, level, steps, heading_note)
+        return text, src, [art["id"]]
+
     def _format_article(self, art, level, steps=None, heading_note=""):
         steps = steps or art["steps"]
         is_ticket = art["id"].startswith("JIRA")
-        src = art.get("url") or (f"https://jira.company.internal/browse/{art['id']}" if is_ticket
-                                 else f"https://confluence.company.internal/display/ITKB/{art['id']}")
+        src = self._src(art)
         kind = "Past resolved ticket" if is_ticket else "KB article"
         source_line = f"\n\n🔗 Source: [{art['id']} – {art['title']}]({src}) ({kind})"
         if level == "expert" and art.get("expert") and not heading_note:
@@ -115,13 +153,13 @@ class HelpDeskAgent:
                 self.s.audit("CLARIFY", user_id, "ASKED", f"{art['id']}: {clar['question']}", channel=self.channel)
                 return f"Happy to help with that. {clar['question']}", [], "clarification"
             if variant:
-                text, src = self._format_article(art, level, clar["variants"][variant]["steps"], f" ({variant})")
+                text, src, used = self._compose(art, level, query, user_id, clar["variants"][variant]["steps"], f" ({variant})")
             else:
-                text, src = self._format_article(art, level)
+                text, src, used = self._compose(art, level, query, user_id)
         else:
-            text, src = self._format_article(art, level)
+            text, src, used = self._compose(art, level, query, user_id)
         past = self.retriever.related_past_fix(query, exclude_id=art["id"]) if not art["id"].startswith("JIRA") else None
-        if past:
+        if past and past["id"] not in used:
             text += (f"\n\n🗂️ **Related past fix** ([{past['id']}](https://jira.company.internal/browse/{past['id']})): "
                      f"{past['steps'][0]}")
         conv["last_kb"] = {"kb_id": art["id"], "query": query, "category": art["category"]}
@@ -222,7 +260,8 @@ class HelpDeskAgent:
                 variant = self._match_variant(art["clarify"], message)
                 if variant:
                     conv["pending"] = None
-                    text, src = self._format_article(art, level, art["clarify"]["variants"][variant]["steps"], f" ({variant})")
+                    text, src, _ = self._compose(art, level, pending["query"] + f" ({variant})", user_id,
+                                                 art["clarify"]["variants"][variant]["steps"], f" ({variant})")
                     conv["last_kb"] = {"kb_id": art["id"], "query": pending["query"], "category": art["category"]}
                     self.s.audit("KB_ANSWER", user_id, "SUCCESS", f"Answered from {art['id']} variant '{variant}'",
                                  channel=self.channel, meta={"kb_id": art["id"]})
@@ -232,7 +271,7 @@ class HelpDeskAgent:
                 conv["pending"] = None
                 kb_id = pending["options"][int(message.strip()) - 1]
                 art = next(a for a in self.s.kb if a["id"] == kb_id)
-                text, src = self._format_article(art, level)
+                text, src, _ = self._compose(art, level, pending["query"], user_id)
                 conv["last_kb"] = {"kb_id": art["id"], "query": pending["query"], "category": art["category"]}
                 self.s.audit("KB_ANSWER", user_id, "SUCCESS", f"Answered from {kb_id} after disambiguation", channel=self.channel)
                 self.s.interactions.append({"user_id": user_id, "query": pending["query"], "kb_id": kb_id, "outcome": "kb_answer"})

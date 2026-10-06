@@ -341,11 +341,68 @@ def eval_categorization(include_llm=True):
     return pd.DataFrame(results), pd.DataFrame(failures)
 
 
-def run_all(include_llm=True):
+# ---------------------------------------------------------------------------
+# 5. RAG generation (grounding guardrails + live answers when an API key is set)
+# ---------------------------------------------------------------------------
+RAG_PROBES = [
+    ("Invented command", "Run `netsh winsock reset` in a terminal.", "KB102", False),
+    ("Invented URL", "Download the fix from https://fix-it.example.com.", "KB102", False),
+    ("Invented number", "Open UDP port 8443 on your router.", "KB101", False),
+    ("Unsupported advice", "Reboot your router and call your broadband provider.", "KB102", False),
+    ("Faithful paraphrase", "Open File Explorer and select **This PC**.", "KB102", True),
+    ("Faithful command", "Run `ipconfig /flushdns` to flush your DNS cache.", "KB101", True),
+]
+
+
+def eval_rag(generator=None):
+    from rag import check_step
+    store = Store()
+    kb = {a["id"]: a for a in store.kb}
+    probes = []
+    for name, step, art_id, should_pass in RAG_PROBES:
+        a = kb[art_id]
+        problem = check_step(step, a["title"] + " " + " ".join(a["steps"]))
+        probes.append({"probe": name, "generated_step": step, "source": art_id, "expected": "accept" if should_pass else "reject",
+                       "outcome": "accept" if problem is None else "reject", "reason": problem or "",
+                       "passed": (problem is None) == should_pass})
+    probes_df = pd.DataFrame(probes)
+    metrics = {"guardrail_probe_pass_rate": float(probes_df["passed"].mean()), "live": False}
+    live_df = pd.DataFrame()
+    if generator is not None:
+        rows = []
+        for query, expected in RETRIEVAL_GOLDEN:
+            if expected is None:
+                continue
+            agent = HelpDeskAgent(Store())
+            agent.rag = generator
+            reply = agent.handle(query, "user456")
+            pend = agent.s.conversations["user456"]["pending"]
+            if pend and pend.get("type") == "clarify_variant":          # answer the clarifying question
+                reply = agent.handle("I'm working from home", "user456")
+            ev = [e for e in agent.s.audit_log if e["action"] in ("RAG_ANSWER", "RAG_FALLBACK")]
+            mode = agent.last_mode
+            cited = ev[-1]["meta"].get("cited", []) if ev and ev[-1]["action"] == "RAG_ANSWER" else []
+            rows.append({"query": query, "expected": expected, "mode": mode,
+                         "cites_expected": any(c.startswith(expected + ".") for c in cited) if mode == "rag" else None,
+                         "fallback_reason": ev[-1]["details"] if ev and ev[-1]["action"] == "RAG_FALLBACK" else "",
+                         "critical": bool(kb.get(expected, {}).get("critical"))})
+        live_df = pd.DataFrame(rows)
+        eligible = live_df[~live_df["critical"]]
+        rag_rows = eligible[eligible["mode"] == "rag"]
+        metrics.update({"live": True, "model": generator.model,
+                        "rag_answer_rate": float((eligible["mode"] == "rag").mean()) if len(eligible) else 0.0,
+                        "fallback_rate": float((eligible["mode"] != "rag").mean()) if len(eligible) else 0.0,
+                        "citation_accuracy": float(rag_rows["cites_expected"].mean()) if len(rag_rows) else 0.0,
+                        "n": len(eligible)})
+    return metrics, probes_df, live_df
+
+
+def run_all(include_llm=True, rag_generator=None):
     r_metrics, r_df = eval_retrieval()
     i_metrics, i_df, confusion = eval_intent()
     s_metrics, s_df, probes_df = eval_security()
     c_df, c_fail = eval_categorization(include_llm)
+    rag_metrics, rag_probes, rag_live = eval_rag(rag_generator)
     failures = []
     for _, r in r_df[~r_df["correct"] | r_df["hallucinated"]].iterrows():
         failures.append({"suite": "retrieval", "case": r["query"], "expected": r["expected"], "got": r["agent_answer"]})
@@ -356,6 +413,11 @@ def run_all(include_llm=True):
         failures.append({"suite": "security", "case": r["scenario"], "expected": r["expected"], "got": r["outcome"]})
     for _, r in probes_df[~probes_df["passed"]].iterrows():
         failures.append({"suite": "security-probe", "case": r["probe"], "expected": r["expected"], "got": r["executed"]})
+    for _, r in rag_probes[~rag_probes["passed"]].iterrows():
+        failures.append({"suite": "rag-guardrail", "case": r["generated_step"], "expected": r["expected"], "got": r["outcome"]})
+    if not rag_live.empty:
+        for _, r in rag_live[(rag_live["mode"] != "rag") & ~rag_live["critical"]].iterrows():
+            failures.append({"suite": "rag-fallback", "case": r["query"], "expected": "rag", "got": r["fallback_reason"][:120]})
     for _, r in c_fail.head(15).iterrows():
         failures.append({"suite": f"categorization ({r['model']})", "case": r["ticket"], "expected": r["expected"], "got": r["predicted"]})
     return {
@@ -363,6 +425,7 @@ def run_all(include_llm=True):
         "intent": (i_metrics, i_df, confusion),
         "security": (s_metrics, s_df, probes_df),
         "categorization": c_df,
+        "rag": (rag_metrics, rag_probes, rag_live),
         "failures": pd.DataFrame(failures, columns=["suite", "case", "expected", "got"]),
     }
 
@@ -385,6 +448,16 @@ def to_markdown(report):
         f"| Security | **Auto-remediation false-positive rate** | {pct(s['false_positive_rate'])} (v1: {pct(s['v1_false_positive_rate'])}) |",
         f"| Security | Privileged actions without verification | {s['unverified_executions']} |",
         f"| Security | Direct tool-call probes passed | {pct(s['tool_probe_pass_rate'])} |",
+        f"| RAG | Grounding guardrail probes passed | {pct(report['rag'][0]['guardrail_probe_pass_rate'])} |",
+    ]
+    rm = report["rag"][0]
+    if rm.get("live"):
+        lines += [f"| RAG | Answered by RAG (non-critical, n={rm['n']}, {rm['model']}) | {pct(rm['rag_answer_rate'])} |",
+                  f"| RAG | Fell back to verified quotes | {pct(rm['fallback_rate'])} |",
+                  f"| RAG | Cited the expected runbook | {pct(rm['citation_accuracy'])} |"]
+    else:
+        lines += ["| RAG | Live generation | not run (no ANTHROPIC_API_KEY) |"]
+    lines += [
         "", "## Ticket categorisation vs historical JIRA labels", "",
         report["categorization"].to_markdown(index=False, floatfmt=".3f") if _has_tabulate() else report["categorization"].to_string(index=False),
         "", "## Failure cases", "",
@@ -407,4 +480,9 @@ def _has_tabulate():
 
 
 if __name__ == "__main__":
-    print(to_markdown(run_all()))
+    import os
+    gen = None
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        from rag import RAGGenerator
+        gen = RAGGenerator(os.environ["ANTHROPIC_API_KEY"], os.environ.get("GENIE_MODEL") or None)
+    print(to_markdown(run_all(rag_generator=gen)))

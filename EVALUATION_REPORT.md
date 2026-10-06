@@ -15,6 +15,8 @@
 | Security | **Auto-remediation false-positive rate** | 0% (v1: 25%) |
 | Security | Privileged actions without verification | 0 |
 | Security | Direct tool-call probes passed | 100% |
+| RAG | Grounding guardrail probes passed | 100% |
+| RAG | Live generation | not run (no ANTHROPIC_API_KEY) |
 
 ## Ticket categorisation vs historical JIRA labels
 

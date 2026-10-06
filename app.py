@@ -35,6 +35,15 @@ if "store" not in st.session_state:
     ticket_client, knowledge, problems = (mcp_client.build_integrations(servers, integrations, st.session_state.store)
                                           if mcp_client else (None, None, []))
     st.session_state.agent.tools.jira = ticket_client
+    # RAG generation step (optional): needs ANTHROPIC_API_KEY in Secrets
+    try:
+        _key = str(st.secrets.get("ANTHROPIC_API_KEY", "") or "")
+        _model = str(st.secrets.get("GENIE_MODEL", "") or "") or None
+    except Exception:
+        _key, _model = "", None
+    if _key:
+        from rag import RAGGenerator
+        st.session_state.agent.rag = RAGGenerator(_key, _model)
     st.session_state.agent.external_kb = knowledge
     st.session_state.mcp = {"servers": servers, "integrations": integrations, "problems": problems, "tools": {}}
 store = st.session_state.store
@@ -102,6 +111,13 @@ st.sidebar.divider()
 style = st.sidebar.select_slider("Response style", ["beginner", "auto", "standard", "expert"], value="auto",
                                  help="'auto' adapts to the vocabulary the user writes with.")
 detected = agent.tech_level(user_id, "", "auto") if style == "auto" else style
+if agent.rag is not None:
+    mode = st.sidebar.radio("Answers", ["✨ Generated (RAG)", "📖 Verified quotes"],
+                            help="RAG: Claude writes the answer from the retrieved runbooks, and every step is checked "
+                                 "against its source. Quotes: the runbook steps exactly as written.")
+    agent.rag_enabled = mode.startswith("✨")
+else:
+    agent.rag_enabled = False
 st.sidebar.caption(f"Current style for {user_id}: **{detected}**")
 
 with st.sidebar.expander("📱 Demo: user's registered phone", expanded=True):
@@ -148,8 +164,11 @@ if page == PAGES[0]:
     prompt = st.chat_input("Describe your IT issue…") or st.session_state.pop("queued_prompt", None)
     if prompt:
         chat.append({"role": "user", "content": prompt})
+        agent.last_mode = None
         reply = agent.handle(prompt, user_id, style)
         meta = f"intent: {reply.intent_class}"
+        if reply.intent_class in ("informational", "mixed") and agent.last_mode:
+            meta += f" · answer: {agent.last_mode}"
         if reply.actions:
             meta += f" · tools: {', '.join(reply.actions)}"
         if reply.awaiting:
@@ -166,7 +185,7 @@ elif page == PAGES[1] and is_admin:
              "The **v1** columns score the routing rules from the original app for comparison.")
     if st.button("▶ Run evaluation", type="primary") or st.session_state.eval_report is None:
         with st.spinner("Running golden datasets…"):
-            st.session_state.eval_report = run_all()
+            st.session_state.eval_report = run_all(rag_generator=agent.rag)
     rep = st.session_state.eval_report
     r, (i, idf, confusion), (s, sdf, probes) = rep["retrieval"][0], rep["intent"], rep["security"]
 
@@ -179,7 +198,8 @@ elif page == PAGES[1] and is_admin:
     best = rep["categorization"].iloc[0]
     c[4].metric("Best categoriser F1", f"{best['macro_f1']:.2f}", best["model"], delta_color="off")
 
-    t = st.tabs(["Retrieval & hallucination", "Intent routing", "Security", "Ticket categorisation", "Failure cases"])
+    t = st.tabs(["Retrieval & hallucination", "Intent routing", "Security", "Ticket categorisation", "RAG generation",
+                 "Failure cases"])
     with t[0]:
         st.write(f"Top-3 recall **{pct(r['top3_recall'])}** · correct abstention on out-of-scope **{pct(r['abstention_accuracy'])}** · "
                  f"ungrounded steps **{pct(r['ungrounded_step_rate'])}**")
@@ -205,6 +225,21 @@ elif page == PAGES[1] and is_admin:
         st.dataframe(cat)
         st.bar_chart(cat.set_index("model")[["accuracy", "macro_f1"]])
     with t[4]:
+        rm, rprobes, rlive = rep["rag"]
+        st.write(f"Grounding guardrail probes passed: **{pct(rm['guardrail_probe_pass_rate'])}**")
+        st.caption("Each probe is a step a model might write. Invented commands, URLs, numbers or advice must be rejected; "
+                   "faithful paraphrases must be accepted.")
+        st.dataframe(rprobes)
+        if rm.get("live"):
+            c = st.columns(3)
+            c[0].metric("Answered by RAG", pct(rm["rag_answer_rate"]), f"n={rm['n']} non-critical", delta_color="off")
+            c[1].metric("Fell back to quotes", pct(rm["fallback_rate"]))
+            c[2].metric("Cited the right runbook", pct(rm["citation_accuracy"]))
+            st.caption(f"Model: {rm['model']}. Critical policies are always quoted, never generated.")
+            st.dataframe(rlive)
+        else:
+            st.info("Live RAG generation was not run. Add ANTHROPIC_API_KEY in Secrets to measure real answers.")
+    with t[5]:
         st.dataframe(rep["failures"])
 
     st.download_button("⬇ Download report (Markdown)", to_markdown(rep), "helpdeskgenie_eval_report.md", "text/markdown")

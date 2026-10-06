@@ -30,7 +30,8 @@ mcp_server.py       MCP server: HelpDeskGenie's tools for Claude Desktop / any M
 mcp_client.py       MCP client: HelpDeskGenie uses other MCP servers (JIRA, Confluence, ...)
 data.py             KB runbooks, past resolved-ticket summaries, users, seed tickets
 store.py            in-memory state + hash-chained audit log + SecOps alerts
-retriever.py        TF-IDF + cosine similarity retrieval with a confidence gate
+retriever.py        TF-IDF + cosine similarity retrieval with a confidence gate (the R in RAG)
+rag.py              Claude writes the answer from retrieved runbooks; every step checked (the G in RAG)
 router.py           intent routing: informational / actionable / mixed / needs_approval
 tools.py            the 7 ITSM tools + OTP verification (all safety rules live here)
 agent.py            conversation orchestration, clarifying questions, adaptive style
@@ -188,6 +189,26 @@ by the organisation admin (on your own site, that's you). Check exact tool names
 **Demo runbooks in Confluence:** `python seed_confluence.py --site https://YOUR-SITE.atlassian.net --email you@example.com --space ITKB`
 (asks for the API token without showing it). It adds runbooks the built-in KB lacks (damaged laptop, slow internet,
 core network changes, lost device, new joiner setup), so external search has something to find.
+
+## RAG: retrieval-augmented generation
+
+1. **Retrieve:** `retriever.py` finds the best runbook (TF-IDF + cosine similarity, gate 0.15) plus up to 2 related ones.
+2. **Generate:** `rag.py` sends only those runbook steps, each with an id like `KB101.2`, to Claude, which writes a
+   clear answer as JSON where every step cites a step id.
+3. **Verify:** before anything is shown, code checks every step: the citation must exist, every command, path, URL,
+   number and bold menu name must appear word for word in the cited runbook, and most of its words must come from it.
+4. **Fall back:** if a check fails, the model abstains, there is no API key, or the API errors, the user gets the verified
+   steps quoted exactly (the original behaviour). Critical policies (passwords, access, lockout, MFA) are never generated.
+
+Turn it on by adding to Streamlit Secrets (top of the file, above any `[sections]`):
+```toml
+ANTHROPIC_API_KEY = "sk-ant-..."
+GENIE_MODEL = "claude-haiku-4-5-20251001"     # optional; this is the default
+```
+Users get an **Answers** switch (Generated RAG / Verified quotes); admins see `answer: rag` or `extractive` under replies;
+the audit log records `RAG_ANSWER` (with citations) or `RAG_FALLBACK` (with the reason). The Evaluation page's
+**RAG generation** tab shows guardrail probes always, and live results (RAG answer rate, fallbacks, citation accuracy)
+when a key is set. The MCP server's `search_it_knowledge_base` still returns verified steps, because the calling AI does its own writing.
 
 ## Caveats to state when presenting
 * The golden datasets are small and were written alongside the code, so the 100% retrieval and intent scores are **in-sample**. Add unseen queries (ideally real user phrasing) before claiming generalisation. The categorisation score is cross-validated, but on synthetic history. Load a real JIRA export with `load_history_csv()`.
