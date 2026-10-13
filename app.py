@@ -162,23 +162,30 @@ if page == PAGES[0]:
         n_open = sum(1 for t in store.tickets if t["user_id"] == user_id and t["status"] not in ("Resolved", "Closed"))
         cells.append(("Your tickets", f"{n_open} open", "wait" if n_open else "ok"))
     first = store.users[user_id]["name"].split()[0]
-    ui.hero(f"What can IT help with, {first}?",
-            "Troubleshooting from verified runbooks, self-service fixes behind identity checks, "
-            "and tickets that reach a person when needed. Every action is audited.", cells)
+    ui.hero(f"Hi {first}, how can Genie help?",
+            "Tell me what's wrong in your own words. Type below or pick a topic, "
+            "and I'll walk you through the fix or get a person on it.", cells)
     chat = st.session_state.chats.setdefault(user_id, [{"role": "assistant", "content": WELCOME}])
 
-    groups = [("Ask a question", ["why does my VPN keep disconnecting", "how do I map a network drive",
-                                  "what is the password policy"]),
-              ("Get something done", ["unlock my account", "my VPN isn't working, can you also log a ticket?",
-                                      "I need access to the finance share for reporting", "show my open tickets"])]
-    k = 0
-    for title, items in groups:
-        ui.label(title)
-        cols = st.columns(len(items))
-        for col, ex in zip(cols, items):
-            if col.button(ex, key=f"ex{k}", use_container_width=True):
+    topics = [("VPN and Wi-Fi", ":material/wifi:", "📶", "why does my VPN keep disconnecting"),
+              ("Email and Teams", ":material/mail:", "✉️", "outlook not syncing emails"),
+              ("Locked out", ":material/lock:", "🔒", "unlock my account"),
+              ("Password reset", ":material/key:", "🔑", "forgot my password"),
+              ("Request access", ":material/folder_shared:", "📁", "I need access to the finance share for reporting"),
+              ("Printers", ":material/print:", "🖨️", "printer not printing my documents")]
+    ui.label("Common topics")
+    for row in range(0, len(topics), 3):
+        cols = st.columns(3)
+        for i, (col, (name, icon, emoji, ex)) in enumerate(zip(cols, topics[row:row + 3])):
+            key = f"ex{row + i}"
+            try:      # material icons need Streamlit 1.37+; fall back to an emoji label
+                clicked = col.button(name, key=key, icon=icon, use_container_width=True)
+            except TypeError:
+                clicked = col.button(f"{emoji} {name}", key=key, use_container_width=True)
+            if clicked:
                 st.session_state.queued_prompt = ex
-            k += 1
+    if st.button("Show my open tickets", key="ex6"):
+        st.session_state.queued_prompt = "show my open tickets"
 
     for m in chat:
         with st.chat_message(m["role"]):
