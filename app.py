@@ -14,6 +14,7 @@ import analytics
 from agent import HelpDeskAgent
 from evaluation import run_all, to_markdown, unverified_privileged_actions
 from store import Store
+import ui
 
 try:
     import mcp_client
@@ -21,6 +22,7 @@ except ImportError:                  # `mcp` not installed: app still works, MCP
     mcp_client = None
 
 st.set_page_config(page_title="HelpDeskGenie", page_icon="🧞", layout="wide")
+ui.inject()
 
 # ---------------------------------------------------------------------------
 # Session state
@@ -69,7 +71,7 @@ def admin_passcode():
 # ---------------------------------------------------------------------------
 # Sidebar: identity first, then the pages that identity may see
 # ---------------------------------------------------------------------------
-st.sidebar.title("🧞 HelpDeskGenie")
+ui.brand()
 user_id = st.sidebar.selectbox(
     "Signed in as (SSO identity)", list(store.users),
     format_func=lambda u: f"{u} – {store.users[u]['name']}" + (" 🔒" if store.users[u].get("locked") else "")
@@ -103,6 +105,7 @@ if store.users[user_id].get("role") == "it_admin":
         st.session_state.admin_ok = False
         st.rerun()
 
+ui.who(store.users[user_id], is_admin)
 visible = ADMIN_PAGES if is_admin else EMPLOYEE_PAGES
 page = st.sidebar.radio("View", visible)
 if page not in visible:          # defence in depth: never render a page this identity may not see
@@ -142,18 +145,40 @@ def pct(x):
 # 💬 Chat
 # ---------------------------------------------------------------------------
 if page == PAGES[0]:
-    st.title("💬 HelpDeskGenie")
-    st.caption("Answers come only from verified KB articles and past resolved tickets. Account changes need a one-time code. "
-               "Access is only granted by a human approver. Every action is audited.")
+    n_runbooks = sum(1 for a in store.kb if not a["id"].startswith("JIRA"))
+    jira = getattr(agent.tools.jira, "label", None)
+    cells = [
+        ("Knowledge base", f"{n_runbooks} verified runbooks", "ok"),
+        ("Answers", "Claude RAG, source-checked" if (agent.rag is not None and agent.rag_enabled) else "Verified quotes", "ok"),
+        ("Tickets go to", ("JIRA " + jira.split(":", 1)[1]) if jira and jira.startswith("jira:")
+         else (f"{jira.split('/')[0]} over MCP" if jira else "Local service desk"), "ok" if jira else "off"),
+        ("Account changes", "One-time code required", "ok"),
+    ]
+    if is_admin:
+        n_alerts = len(store.email_alerts)
+        cells.append(("Security", f"{n_alerts} SecOps alert{'s' if n_alerts != 1 else ''}" if n_alerts else "No alerts",
+                      "alert" if n_alerts else "ok"))
+    else:
+        n_open = sum(1 for t in store.tickets if t["user_id"] == user_id and t["status"] not in ("Resolved", "Closed"))
+        cells.append(("Your tickets", f"{n_open} open", "wait" if n_open else "ok"))
+    first = store.users[user_id]["name"].split()[0]
+    ui.hero(f"What can IT help with, {first}?",
+            "Troubleshooting from verified runbooks, self-service fixes behind identity checks, "
+            "and tickets that reach a person when needed. Every action is audited.", cells)
     chat = st.session_state.chats.setdefault(user_id, [{"role": "assistant", "content": WELCOME}])
 
-    examples = ["why does my VPN keep disconnecting", "how do I map a network drive", "unlock my account",
-                "my VPN isn't working, can you also log a ticket?", "I need access to the finance share for reporting",
-                "show my open tickets"]
-    cols = st.columns(3)
-    for i, ex in enumerate(examples):
-        if cols[i % 3].button(ex, key=f"ex{i}"):
-            st.session_state.queued_prompt = ex
+    groups = [("Ask a question", ["why does my VPN keep disconnecting", "how do I map a network drive",
+                                  "what is the password policy"]),
+              ("Get something done", ["unlock my account", "my VPN isn't working, can you also log a ticket?",
+                                      "I need access to the finance share for reporting", "show my open tickets"])]
+    k = 0
+    for title, items in groups:
+        ui.label(title)
+        cols = st.columns(len(items))
+        for col, ex in zip(cols, items):
+            if col.button(ex, key=f"ex{k}", use_container_width=True):
+                st.session_state.queued_prompt = ex
+            k += 1
 
     for m in chat:
         with st.chat_message(m["role"]):
@@ -180,9 +205,8 @@ if page == PAGES[0]:
 # 🧪 Evaluation
 # ---------------------------------------------------------------------------
 elif page == PAGES[1] and is_admin:
-    st.title("🧪 Iteration 3: Evaluation")
-    st.write("Runs every golden dataset against a fresh sandbox (your demo data is untouched). "
-             "The **v1** columns score the routing rules from the original app for comparison.")
+    ui.header("Evaluation", "Every golden dataset runs against a fresh sandbox, so your demo data is untouched. "
+              "The <b>v1</b> figures score the original app's routing rules for comparison.")
     if st.button("▶ Run evaluation", type="primary") or st.session_state.eval_report is None:
         with st.spinner("Running golden datasets…"):
             st.session_state.eval_report = run_all(rag_generator=agent.rag)
@@ -248,7 +272,8 @@ elif page == PAGES[1] and is_admin:
 # 📊 Admin dashboard
 # ---------------------------------------------------------------------------
 elif page == PAGES[2] and is_admin:
-    st.title("📊 IT Admin Dashboard")
+    ui.header("Admin dashboard", "Ticket trends, recurring issues and the approval queue, computed live from "
+              "tickets and the audit log.")
     m = analytics.remediation_stats(store)
     c = st.columns(5)
     c[0].metric("Tickets", m["tickets_total"])
@@ -315,9 +340,9 @@ elif page == PAGES[2] and is_admin:
 # 📬 SecOps mailbox
 # ---------------------------------------------------------------------------
 elif page == PAGES[3] and is_admin:
-    st.title("📬 Security Operations Mailbox")
-    st.caption("Alerts are raised when privileged actions are attempted without verification, when too many wrong codes "
-               "are entered, when a user targets someone else's account, or when a message asks to bypass controls.")
+    ui.header("Security operations mailbox", "Alerts are raised when privileged actions are attempted without "
+              "verification, too many wrong codes are entered, a user targets someone else's account, or a message "
+              "asks to bypass controls.")
     bad = unverified_privileged_actions(store)
     if bad:
         st.error(f"🚨 {len(bad)} privileged action(s) executed WITHOUT verification. Investigate immediately.")
@@ -335,7 +360,8 @@ elif page == PAGES[3] and is_admin:
 # 🧾 Audit trail
 # ---------------------------------------------------------------------------
 elif page == PAGES[4] and is_admin:
-    st.title("🧾 Audit Trail")
+    ui.header("Audit trail", "Every action the agent took, allowed or refused. Each entry is chained to the one "
+              "before it by a hash, so any edit or deletion is detectable.")
     ok, bad_seq = store.verify_audit_chain()
     if ok:
         st.success(f"🔗 Hash chain intact: {len(store.audit_log)} entries, none altered or removed.")
@@ -357,7 +383,8 @@ elif page == PAGES[4] and is_admin:
 # 🔌 MCP connections
 # ---------------------------------------------------------------------------
 elif page == PAGES[5] and is_admin:
-    st.title("🔌 MCP Connections")
+    ui.header("MCP connections", "How HelpDeskGenie connects to other AI tools and systems through the Model "
+              "Context Protocol.")
     mcp_state = st.session_state.mcp
     is_admin = store.users[user_id].get("role") == "it_admin"
 
@@ -462,7 +489,7 @@ args = { cloudId = "YOUR_CLOUD_ID", cql = "space = ITKB AND text ~ '{query}'" }'
 # 🎫 My tickets (every signed-in user; only their own records)
 # ---------------------------------------------------------------------------
 elif page == PAGES[6]:
-    st.title("🎫 My Tickets")
+    ui.header("My tickets", "Your tickets and access requests. Escalate or close your own open tickets here.")
     flash = st.session_state.pop("ticket_flash", None)
     if flash:
         (st.success if flash[0] else st.error)(flash[1])
