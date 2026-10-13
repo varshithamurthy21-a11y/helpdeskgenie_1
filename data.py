@@ -255,7 +255,7 @@ RESOURCE_OWNERS = {
 
 # Directory (AD/LDAP stand-in).
 USERS = {
-    "user123": {"name": "Asha Rao", "manager": "mgr_eng", "phone": "+91 98xxxx1234", "locked": True, "role": "employee"},
+    "user123": {"name": "Varshitha", "manager": "mgr_eng", "phone": "+91 98xxxx1234", "locked": True, "role": "employee"},
     "user456": {"name": "Rahul Menon", "manager": "mgr_sales", "phone": "+91 98xxxx4456", "locked": False, "role": "employee"},
     "user789": {"name": "Priya Iyer", "manager": "mgr_finance", "phone": "+91 98xxxx7789", "locked": True, "role": "employee"},
     "admin01": {"name": "IT Admin", "manager": "mgr_it", "phone": "+91 98xxxx0001", "locked": False, "role": "it_admin"},
