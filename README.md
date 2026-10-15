@@ -10,6 +10,15 @@ python evaluation.py            # evaluation report in the terminal
 pytest -q                             # tests
 ```
 
+## The four pillars at a glance
+
+| Pillar | What it means here | Where |
+|---|---|---|
+| **RAG** | Retrieve the right verified runbook (TF-IDF + cosine), then Claude writes the answer from it; every step must cite its source and pass grounding checks, else the verified steps are quoted. | `retriever.py`, `rag.py` |
+| **Tool calling** | Claude reads the message and calls tools from JSON schemas (Messages API `tools`): 7 ITSM tools + knowledge-base search. Calls are validated, can't name a user or a token, and still go through OTP and ownership checks. Falls back to the rule router. The same tools are also exposed to any AI assistant over MCP. | `llm_tools.py`, `tools.py`, `mcp_server.py` |
+| **Evaluation** | Golden datasets for retrieval, intent and tool selection, security scenarios, categorisation vs JIRA labels, RAG grounding probes, tool-call guardrail probes and a "hijacked model" test; 37 automated tests. | `evaluation.py`, `tests/` |
+| **Observability** | A trace per message with timed steps (route, plan_tools, retrieve, rag_generate, tool calls), Claude tokens and estimated cost, fallback reasons and errors; admin **Observability** page with p50/p95 latency and JSONL export. Plus the hash-chained audit trail and SecOps alerts. | `observability.py`, `store.py` |
+
 ## Deploy (Streamlit Community Cloud, free)
 
 1. Push this folder to a GitHub repository (`app.py` at the repository root).
@@ -32,6 +41,8 @@ data.py             KB runbooks, past resolved-ticket summaries, users, seed tic
 store.py            in-memory state + hash-chained audit log + SecOps alerts
 retriever.py        TF-IDF + cosine similarity retrieval with a confidence gate (the R in RAG)
 rag.py              Claude writes the answer from retrieved runbooks; every step checked (the G in RAG)
+llm_tools.py        tool calling: Claude chooses the tools from JSON schemas; calls are validated
+observability.py    per-message traces: step timings, Claude tokens and cost, fallbacks, errors
 router.py           intent routing: informational / actionable / mixed / needs_approval
 tools.py            the 7 ITSM tools + OTP verification (all safety rules live here)
 agent.py            conversation orchestration, clarifying questions, adaptive style
@@ -210,7 +221,25 @@ the audit log records `RAG_ANSWER` (with citations) or `RAG_FALLBACK` (with the 
 **RAG generation** tab shows guardrail probes always, and live results (RAG answer rate, fallbacks, citation accuracy)
 when a key is set. The MCP server's `search_it_knowledge_base` still returns verified steps, because the calling AI does its own writing.
 
+## Tool calling with Claude
+
+With `ANTHROPIC_API_KEY` set, `llm_tools.py` sends the message to Claude with the tool definitions. Claude replies with
+`tool_use` blocks (e.g. `create_ticket {issue_type, description, priority}`), which the agent validates and runs.
+Claude cannot pick whose account or ticket is affected (no `user_id` argument; ticket ids must be ones the user typed)
+and cannot skip verification (no `verification_token` argument), and the rule router's security flags (bypass language,
+third-party targets) still apply. If the API fails, the reply is invalid, or Claude calls nothing, the rule router is
+used. Admins get a **Tool selection** switch and see `tools chosen by: claude/rules` under each reply.
+
+## Observability
+
+Every `HelpDeskAgent.handle()` call is a trace with timed spans: `route`, `plan_tools`, `retrieve`, `rag_generate`,
+`tool:<name>`, `verify_otp`. Claude calls record input/output tokens and an estimated cost; fallbacks record why. The
+admin **🔭 Observability** page shows request count, p50/p95 latency, tokens and cost, grounding and planner success,
+time per step, fallback reasons, recent traces and a step-by-step view of any trace, and exports JSON Lines that
+Langfuse, LangSmith or an OpenTelemetry pipeline can ingest. Traces are in memory (last 500 per session).
+
 ## Caveats to state when presenting
 * The golden datasets are small and were written alongside the code, so the 100% retrieval and intent scores are **in-sample**. Add unseen queries (ideally real user phrasing) before claiming generalisation. The categorisation score is cross-validated, but on synthetic history. Load a real JIRA export with `load_history_csv()`.
 * Retrieval is lexical (TF-IDF). A query that only shares one keyword with an article can match it; for example, "Outlook keeps crashing" matches the Outlook *sync* article. Sentence embeddings would be the natural next step, and the eval harness will measure the gain.
+* Traces and data are in memory per browser session; production would ship traces to a store such as Langfuse or OpenTelemetry.
 * Data is in memory per browser session. JIRA, AD and SMS are mocked; the demo phone panel stands in for SMS.

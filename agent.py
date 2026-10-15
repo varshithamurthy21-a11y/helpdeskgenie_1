@@ -8,6 +8,7 @@ import re
 from dataclasses import dataclass, field
 
 from categorizer import TicketCategorizer
+from observability import Tracer
 from retriever import KBRetriever
 from router import route
 from tools import ITSMTools
@@ -49,6 +50,10 @@ class HelpDeskAgent:
         self.rag = None                  # optional RAGGenerator (see rag.py); None = quote verified steps
         self.rag_enabled = True
         self.last_mode = None            # "rag" | "extractive", for the UI
+        self.planner = None              # optional llm_tools.ToolPlanner: Claude chooses the tools
+        self.planner_enabled = True
+        self.last_selection = None       # "claude" | "rules", for the UI
+        self.tracer = Tracer(store)      # observability: one trace per message (observability.py)
         if not hasattr(store, "conversations"):
             store.conversations = {}
 
@@ -92,7 +97,14 @@ class HelpDeskAgent:
                 if a["id"] != art["id"] and not a.get("critical") and sc >= gate and sc >= 0.5 * best and len(context) < 3:
                     context.append({"id": a["id"], "title": a["title"], "steps": a["steps"]})
                     by_id[a["id"]] = a
-            res = self.rag.generate(query, context, level)
+            with self.tracer.span("rag_generate", kb_id=art["id"], context=[c["id"] for c in context]) as sp:
+                res = self.rag.generate(query, context, level)
+                sp["attrs"].update(grounded=res.ok, cited=res.cited)
+                if not res.ok:
+                    sp["attrs"]["fallback_reason"] = res.reason
+                    if res.reason.startswith("API error"):
+                        sp["status"] = "error"
+                self.tracer.add_usage(sp, getattr(self.rag, "last_usage", None), self.rag.model)
             if res.ok:
                 self.last_mode = "rag"
                 links = " · ".join(f"[{i} – {by_id[i]['title']}]({self._src(by_id[i])})" for i in res.sources)
@@ -122,7 +134,14 @@ class HelpDeskAgent:
 
     # -------------------------------------------------------------- KB path
     def _answer_info(self, query, user_id, level, conv, can_ask=True):
-        amb = self.retriever.ambiguous(query) if can_ask else None
+        with self.tracer.span("retrieve", query=query[:120]) as sp:
+            amb = self.retriever.ambiguous(query) if can_ask else None
+            hit = None if amb else self.retriever.best(query)
+            sp["attrs"].update(ambiguous=bool(amb), kb_id=hit[0]["id"] if hit else None,
+                               score=round(hit[1], 3) if hit else None)
+        return self._answer_from(query, user_id, level, conv, can_ask, amb, hit)
+
+    def _answer_from(self, query, user_id, level, conv, can_ask, amb, hit):
         if amb:
             a1, a2 = amb
             conv["pending"] = {"type": "disambiguate", "options": [a1["id"], a2["id"]], "query": query}
@@ -130,7 +149,6 @@ class HelpDeskAgent:
             return (f"I want to make sure I give you the right steps. Is this about **{a1['title']}** (reply 1) "
                     f"or **{a2['title']}** (reply 2)?"), [], "clarification"
 
-        hit = self.retriever.best(query)
         if hit is None:
             self.s.audit("ABSTAIN", user_id, "NO_KB_MATCH", f"No verified runbook for: {query[:80]}", channel=self.channel)
             self.s.interactions.append({"user_id": user_id, "query": query, "kb_id": None, "outcome": "abstained"})
@@ -206,31 +224,86 @@ class HelpDeskAgent:
                 self.s.secops_alert(user_id, op, "Self-service request tried to act on a different user's account.")
                 return ("❌ I can only unlock or reset **your own** account after verifying you. "
                         "If a colleague is locked out, they need to contact me themselves or call the service desk."), None
-            res = self.tools.start_verification(user_id, op)
+            with self.tracer.span("tool:start_verification", action=op) as sp:
+                res = self.tools.start_verification(user_id, op)
+                sp["attrs"]["ok"] = bool(res)
             if not res:
                 return res["message"], None
             self._conv(user_id)["pending"] = {"type": "otp", "challenge_id": res["challenge_id"], "tool": tool}
             return res["message"], "otp"
         fn = getattr(self.tools, tool)
-        res = fn(user_id, **args)
+        with self.tracer.span(f"tool:{tool}", args={k: str(v)[:60] for k, v in args.items()}) as sp:
+            res = fn(user_id, **args)
+            sp["attrs"]["ok"] = bool(res)
         return res["message"], None
 
     def _complete_otp(self, message, user_id, conv):
         p = conv["pending"]
         code = CODE_RE.search(message).group(1)
-        res = self.tools.verify_otp(user_id, p["challenge_id"], code)
+        with self.tracer.span("verify_otp", action=p["tool"]) as sp:
+            res = self.tools.verify_otp(user_id, p["challenge_id"], code)
+            sp["attrs"]["ok"] = bool(res)
         if not res:
             if not res.get("retry"):
                 conv["pending"] = None
             return AgentReply(res["message"], "actionable", awaiting="otp" if res.get("retry") else None)
         conv["pending"] = None
-        out = getattr(self.tools, p["tool"])(user_id, verification_token=res["token"])
+        with self.tracer.span(f"tool:{p['tool']}", verified=True) as sp:
+            out = getattr(self.tools, p["tool"])(user_id, verification_token=res["token"])
+            sp["attrs"]["ok"] = bool(out)
         self.s.interactions.append({"user_id": user_id, "query": p["tool"], "kb_id": None,
                                     "outcome": "auto_remediated" if out else "remediation_failed"})
         return AgentReply(out["message"], "actionable", actions=[p["tool"]])
 
     # ------------------------------------------------------------- main
     def handle(self, message, user_id, style="auto"):
+        """Answer one message. Every call is traced (see observability.py)."""
+        self.tracer.start(user_id, message, self.channel)
+        self.last_mode, self.last_selection = None, None
+        try:
+            reply = self._handle(message, user_id, style)
+        except Exception as e:
+            self.tracer.finish(error=e)
+            raise
+        self.tracer.set(answer_mode=self.last_mode, tool_selection=self.last_selection)
+        self.tracer.finish(reply.intent_class, reply.actions, reply.awaiting)
+        return reply
+
+    def _plan_tools(self, message, user_id, r):
+        """Let Claude choose the tools (tool calling). Falls back to the rule router's plan."""
+        if self.planner is None or not self.planner_enabled or r.intent_class == "greeting":
+            self.last_selection = "rules"
+            return r
+        with self.tracer.span("plan_tools", model=self.planner.model) as sp:
+            plan = self.planner.plan(message, self.categorizer)
+            self.tracer.add_usage(sp, plan.usage, self.planner.model)
+            sp["attrs"].update(used=plan.ok, claude_calls=plan.raw_calls,
+                               rules_chose=[a["tool"] for a in r.actions])
+            if not plan.ok:
+                sp["attrs"]["fallback_reason"] = plan.reason
+                if plan.reason.startswith("API error"):
+                    sp["status"] = "error"
+        if not plan.ok:
+            self.last_selection = "rules"
+            self.s.audit("TOOL_PLAN", user_id, "FALLBACK", f"Rule router used: {plan.reason}", channel=self.channel)
+            return r
+        self.last_selection = "claude"
+        self.s.audit("TOOL_PLAN", user_id, "SUCCESS",
+                     f"Claude chose {[a['tool'] for a in plan.actions] + (['search_knowledge_base'] if plan.info_query else [])}",
+                     channel=self.channel, meta={"calls": plan.raw_calls, "model": self.planner.model})
+        actions, info = plan.actions, plan.info_query
+        if any(a["tool"] == "grant_access_request" for a in actions):
+            cls = "needs_approval"
+        elif actions and info:
+            cls = "mixed"
+        elif actions:
+            cls = "actionable"
+        else:
+            cls = "informational"
+        r.intent_class, r.actions, r.info_query = cls, actions, info   # security flags from the rules are kept
+        return r
+
+    def _handle(self, message, user_id, style="auto"):
         message = (message or "").strip()
         conv = self._conv(user_id)
         level = self.tech_level(user_id, message, style)
@@ -248,7 +321,9 @@ class HelpDeskAgent:
                 if YES_RE.search(message):
                     conv["pending"] = None
                     cat, _ = self.categorizer.predict(pending["query"])
-                    res = self.tools.create_ticket(user_id, cat, pending["query"])
+                    with self.tracer.span("tool:create_ticket", issue_type=cat) as sp:
+                        res = self.tools.create_ticket(user_id, cat, pending["query"])
+                        sp["attrs"]["ok"] = bool(res)
                     self.s.interactions.append({"user_id": user_id, "query": pending["query"], "kb_id": None, "outcome": "ticket"})
                     return AgentReply(res["message"] + " An engineer will pick it up; you can ask me for its status any time.",
                                       "actionable", actions=["create_ticket"])
@@ -291,7 +366,10 @@ class HelpDeskAgent:
             return AgentReply("Please type your question.", "informational")
 
         # 3. Route
-        r = route(message, user_id, self.retriever, self.categorizer)
+        with self.tracer.span("route") as sp:
+            r = route(message, user_id, self.retriever, self.categorizer)
+            sp["attrs"].update(intent=r.intent_class, tools=[a["tool"] for a in r.actions], flags=r.flags)
+        r = self._plan_tools(message, user_id, r)
         self.s.audit("ROUTE", user_id, "INFO", f"{r.intent_class}: tools={[a['tool'] for a in r.actions]} flags={r.flags}",
                      channel=self.channel, meta={"message": message[:200]})
         if r.intent_class == "greeting":

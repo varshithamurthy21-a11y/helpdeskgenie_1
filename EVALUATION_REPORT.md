@@ -17,6 +17,9 @@
 | Security | Direct tool-call probes passed | 100% |
 | RAG | Grounding guardrail probes passed | 100% |
 | RAG | Live generation | not run (no ANTHROPIC_API_KEY) |
+| Tool calling | Guardrail probes on Claude's tool calls | 100% |
+| Tool calling | **Unverified actions with a hijacked model** (11 scenarios) | 0 |
+| Tool calling | Live Claude tool selection | not run (no ANTHROPIC_API_KEY) |
 
 ## Ticket categorisation vs historical JIRA labels
 

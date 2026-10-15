@@ -60,8 +60,6 @@ LOGO_SVG = ('<svg width="40" height="40" viewBox="0 0 44 44" aria-hidden="true">
             'stroke-linecap="round" fill="none"/></svg>')
 
 CSS = f"""
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap">
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap');
 
@@ -183,7 +181,10 @@ section.main [data-testid="stMarkdownContainer"] p, section.main [data-testid="s
 
 
 def inject():
-    st.markdown(CSS, unsafe_allow_html=True)
+    # One <style> block with no blank lines: Markdown ends an HTML block at a blank line,
+    # and anything after it would be shown on the page as text.
+    css = "\n".join(line for line in CSS.strip().splitlines() if line.strip())
+    st.markdown(css, unsafe_allow_html=True)
 
 
 def esc(x):

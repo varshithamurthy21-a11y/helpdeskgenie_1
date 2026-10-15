@@ -120,6 +120,7 @@ class RAGGenerator:
         self.model = model or DEFAULT_MODEL
         self.timeout = timeout
         self.transport = transport          # tests inject httpx.MockTransport
+        self.last_usage = None              # token usage of the last API call (for observability)
 
     @staticmethod
     def build_context(articles):
@@ -143,12 +144,14 @@ class RAGGenerator:
         if r.status_code != 200:
             raise RuntimeError(f"Claude API HTTP {r.status_code}: {r.text[:160]}")
         data = r.json()
+        self.last_usage = data.get("usage")
         return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
 
     def generate(self, query, articles, level="standard"):
         context, steps, full = self.build_context(articles)
         system = SYSTEM.replace("{style}", STYLES.get(level, STYLES["standard"]))
         user = f"CONTEXT:\n{context}\n\nUSER QUESTION: {query}"
+        self.last_usage = None
         try:
             raw = self._call(system, user)
         except Exception as e:  # noqa: BLE001 - any API problem means: fall back

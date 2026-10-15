@@ -11,6 +11,7 @@ import pandas as pd
 import streamlit as st
 
 import analytics
+import observability
 from agent import HelpDeskAgent
 from evaluation import run_all, to_markdown, unverified_privileged_actions
 from store import Store
@@ -27,6 +28,8 @@ ui.inject()
 # ---------------------------------------------------------------------------
 # Session state
 # ---------------------------------------------------------------------------
+if "agent" in st.session_state and not hasattr(st.session_state.agent, "tracer"):
+    st.session_state.clear()          # session started on an older version of the app: start fresh
 if "store" not in st.session_state:
     st.session_state.store = Store()
     st.session_state.agent = HelpDeskAgent(st.session_state.store)
@@ -46,6 +49,8 @@ if "store" not in st.session_state:
     if _key:
         from rag import RAGGenerator
         st.session_state.agent.rag = RAGGenerator(_key, _model)
+        from llm_tools import ToolPlanner          # tool calling: Claude chooses which tools to run
+        st.session_state.agent.planner = ToolPlanner(_key, _model)
     st.session_state.agent.external_kb = knowledge
     st.session_state.mcp = {"servers": servers, "integrations": integrations, "problems": problems, "tools": {}}
 store = st.session_state.store
@@ -55,9 +60,9 @@ WELCOME = ("Hi, I'm **HelpDeskGenie**. Ask me an IT question (VPN, Wi-Fi, Outloo
            "or ask me to unlock your account, reset your password, raise an access request, or log/check a ticket.")
 
 PAGES = ["💬 HelpDesk Chat", "🧪 Evaluation (Iteration 3)", "📊 Admin Dashboard", "📬 SecOps Mailbox", "🧾 Audit Trail",
-         "🔌 MCP Connections", "🎫 My Tickets"]
+         "🔌 MCP Connections", "🎫 My Tickets", "🔭 Observability"]
 EMPLOYEE_PAGES = [PAGES[0], PAGES[6]]
-ADMIN_PAGES = [PAGES[0], PAGES[6], PAGES[2], PAGES[1], PAGES[3], PAGES[4], PAGES[5]]
+ADMIN_PAGES = [PAGES[0], PAGES[6], PAGES[2], PAGES[1], PAGES[7], PAGES[3], PAGES[4], PAGES[5]]
 
 
 def admin_passcode():
@@ -121,6 +126,11 @@ if agent.rag is not None:
     agent.rag_enabled = mode.startswith("✨")
 else:
     agent.rag_enabled = False
+if agent.planner is not None:
+    picker = st.sidebar.radio("Tool selection", ["🤖 Claude chooses tools", "📏 Rule-based router"],
+                              help="Claude: the model reads the message and calls the right tools (tool calling). "
+                                   "Rules: keyword patterns. Either way, every tool keeps its security checks.")
+    agent.planner_enabled = picker.startswith("🤖")
 st.sidebar.caption(f"Current style for {user_id}: **{detected}**")
 
 with st.sidebar.expander("📱 Demo: user's registered phone", expanded=True):
@@ -199,6 +209,8 @@ if page == PAGES[0]:
         agent.last_mode = None
         reply = agent.handle(prompt, user_id, style)
         meta = f"intent: {reply.intent_class}"
+        if agent.last_selection:
+            meta += f" · tools chosen by: {agent.last_selection}"
         if reply.intent_class in ("informational", "mixed") and agent.last_mode:
             meta += f" · answer: {agent.last_mode}"
         if reply.actions:
@@ -216,7 +228,7 @@ elif page == PAGES[1] and is_admin:
               "The <b>v1</b> figures score the original app's routing rules for comparison.")
     if st.button("▶ Run evaluation", type="primary") or st.session_state.eval_report is None:
         with st.spinner("Running golden datasets…"):
-            st.session_state.eval_report = run_all(rag_generator=agent.rag)
+            st.session_state.eval_report = run_all(rag_generator=agent.rag, tool_planner=agent.planner)
     rep = st.session_state.eval_report
     r, (i, idf, confusion), (s, sdf, probes) = rep["retrieval"][0], rep["intent"], rep["security"]
 
@@ -230,7 +242,7 @@ elif page == PAGES[1] and is_admin:
     c[4].metric("Best categoriser F1", f"{best['macro_f1']:.2f}", best["model"], delta_color="off")
 
     t = st.tabs(["Retrieval & hallucination", "Intent routing", "Security", "Ticket categorisation", "RAG generation",
-                 "Failure cases"])
+                 "Tool calling", "Failure cases"])
     with t[0]:
         st.write(f"Top-3 recall **{pct(r['top3_recall'])}** · correct abstention on out-of-scope **{pct(r['abstention_accuracy'])}** · "
                  f"ungrounded steps **{pct(r['ungrounded_step_rate'])}**")
@@ -271,6 +283,29 @@ elif page == PAGES[1] and is_admin:
         else:
             st.info("Live RAG generation was not run. Add ANTHROPIC_API_KEY in Secrets to measure real answers.")
     with t[5]:
+        tm, tprobes, thijack, tlive = rep["tools"]
+        c = st.columns(2)
+        c[0].metric("Guardrails on Claude's tool calls", pct(tm["guardrail_probe_pass_rate"]))
+        c[1].metric("Unverified actions, hijacked model", tm["hijacked_unverified_executions"],
+                    f"{tm['hijacked_scenarios']} scenarios", delta_color="off")
+        st.caption("Each probe feeds the planner a tool call Claude might make. Invented ticket ids, unknown tools and "
+                   "smuggled arguments must be rejected or stripped; outages must fall back to the rule router.")
+        st.dataframe(tprobes, hide_index=True)
+        ui.label("Hijacked-model test")
+        st.caption("Every security scenario is replayed with a fake 'Claude' that always calls unlock_account and "
+                   "reset_password, as a prompt-injected model might. Nothing may run without a valid one-time code.")
+        st.dataframe(thijack[["scenario", "turns", "expected", "outcome", "unverified_executions", "passed"]], hide_index=True)
+        if tm.get("live"):
+            c = st.columns(3)
+            c[0].metric("Claude tool-selection accuracy", pct(tm["claude_tool_accuracy"]),
+                        f"rules: {pct(tm['rules_tool_accuracy'])}", delta_color="off")
+            c[1].metric("Fell back to rules", pct(tm["fallback_rate"]))
+            c[2].metric("Avg tokens per plan", f"{tm['avg_tokens']:.0f}")
+            st.caption(f"Model: {tm['model']}. Same {tm['n']} labelled messages as the intent suite.")
+            st.dataframe(tlive, hide_index=True)
+        else:
+            st.info("Live Claude tool selection was not run. Add ANTHROPIC_API_KEY in Secrets to measure it.")
+    with t[6]:
         st.dataframe(rep["failures"])
 
     st.download_button("⬇ Download report (Markdown)", to_markdown(rep), "helpdeskgenie_eval_report.md", "text/markdown")
@@ -362,6 +397,63 @@ elif page == PAGES[3] and is_admin:
         with st.expander(f"{icon} [{a['severity']}] {a['subject']} · {a['sent_at']}"):
             st.write(f"**To:** {a['recipient']}  \n**User:** {a['user_id']}  \n**Action:** {a['action']}")
             st.write(a["body"])
+
+# ---------------------------------------------------------------------------
+# 🔭 Observability
+# ---------------------------------------------------------------------------
+elif page == PAGES[7] and is_admin:
+    ui.header("Observability", "A trace for every message: what each step did, how long it took, how many Claude "
+              "tokens it used and why any fallback happened. The audit trail says <i>who did what</i>; traces say "
+              "<i>how the AI got there</i>.")
+    traces = store.traces
+    if not traces:
+        st.info("No traces yet. Send Genie a few messages on the chat page, then come back here.")
+    else:
+        sm = observability.summary(traces)
+        c = st.columns(5)
+        c[0].metric("Requests traced", sm["requests"])
+        c[1].metric("Latency p50 / p95", f"{sm['p50_ms']:.0f} / {sm['p95_ms']:.0f} ms")
+        c[2].metric("Claude tokens (in / out)", f"{sm['tokens_in']:,} / {sm['tokens_out']:,}")
+        c[3].metric("Estimated cost", f"${sm['cost_usd']:.4f}")
+        c[4].metric("Errors / degraded", f"{sm['errors']} / {sm['degraded']}",
+                    help="Degraded = a step failed (e.g. Claude API) but a fallback still answered.")
+        c = st.columns(3)
+        c[0].metric("RAG answers grounded", f"{sm['rag_ok']} of {sm['rag_calls']}" if sm["rag_calls"] else "not used")
+        c[1].metric("Claude tool plans used", f"{sm['plan_ok']} of {sm['plan_calls']}" if sm["plan_calls"] else "not used")
+        c[2].metric("Tool calls (failed)", f"{sm['tool_calls']} ({sm['tool_failures']})")
+
+        left, right = st.columns(2)
+        with left:
+            ui.label("Time per step")
+            stats = pd.DataFrame(observability.span_stats(traces))
+            st.bar_chart(stats.set_index("step")[["avg_ms"]])
+            st.dataframe(stats, hide_index=True)
+        with right:
+            ui.label("Latency per request")
+            lat = pd.DataFrame({"latency_ms": [t["latency_ms"] for t in traces]})
+            st.line_chart(lat)
+            reasons = observability.fallback_reasons(traces)
+            ui.label("Fallback reasons")
+            if reasons:
+                st.dataframe(pd.DataFrame(reasons, columns=["reason", "count"]), hide_index=True)
+            else:
+                st.caption("No fallbacks: every Claude output that was requested passed its checks.")
+
+        ui.label("Recent traces")
+        rows = [{"time": t["ts"][11:19], "trace": t["id"], "user": t["user_id"], "message": t["message"][:60],
+                 "intent": t["intent"], "tools chosen by": t.get("tool_selection"), "answer": t.get("answer_mode"),
+                 "tools": ", ".join(t["tools"]), "ms": t["latency_ms"], "tokens": t["tokens_in"] + t["tokens_out"],
+                 "status": t["status"]} for t in reversed(traces)]
+        st.dataframe(pd.DataFrame(rows), hide_index=True)
+        pick = st.selectbox("Open a trace", [t["id"] for t in reversed(traces)],
+                            format_func=lambda i: next(f"{t['id']} · {t['message'][:50]}" for t in traces if t["id"] == i))
+        tr = next(t for t in traces if t["id"] == pick)
+        st.caption(f"{tr['ts']} · {tr['user_id']} · {tr['latency_ms']} ms · status {tr['status']}")
+        st.dataframe(pd.DataFrame([{"step": sp["name"], "starts at (ms)": sp["start_ms"], "took (ms)": sp["ms"],
+                                    "status": sp["status"], "details": str(sp["attrs"])[:300]} for sp in tr["spans"]]),
+                     hide_index=True)
+        st.download_button("⬇ Download traces (JSON Lines)", observability.to_jsonl(traces),
+                           "helpdeskgenie_traces.jsonl", "application/json")
 
 # ---------------------------------------------------------------------------
 # 🧾 Audit trail
