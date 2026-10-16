@@ -94,9 +94,13 @@ section.main [data-testid="stMarkdownContainer"] p, section.main [data-testid="s
 [data-testid="stSidebar"] [data-testid="stCaptionContainer"] * {{ color: #9DB7CF; }}
 [data-testid="stSidebar"] label p {{ color: #9DB7CF !important; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; }}
 [data-testid="stSidebar"] [role="radiogroup"] label p {{ color: #E6F1FB !important; font-size: 15px; text-transform: none; letter-spacing: 0; font-weight: 500; }}
-[data-testid="stSidebar"] [data-baseweb="select"] > div, [data-testid="stSidebar"] input {{
-  background: rgba(255,255,255,.08) !important; border: 1px solid rgba(255,255,255,.14) !important; border-radius: 12px !important; color: #fff !important; }}
-[data-testid="stSidebar"] [data-baseweb="select"] svg {{ fill: #9DB7CF; }}
+/* dropdown and passcode box: white box, dark text, so they are readable on the navy sidebar */
+[data-testid="stSidebar"] [data-baseweb="select"] > div, [data-testid="stSidebar"] [data-baseweb="input"] {{
+  background: #FFFFFF !important; border: 1px solid #CFE3F2 !important; border-radius: 12px !important; }}
+[data-testid="stSidebar"] [data-baseweb="input"] > div, [data-testid="stSidebar"] input {{ background: #FFFFFF !important; border: 0 !important; }}
+[data-testid="stSidebar"] [data-baseweb="select"] *, [data-testid="stSidebar"] [data-baseweb="input"] *,
+[data-testid="stSidebar"] input {{ color: #0F3A5F !important; -webkit-text-fill-color: #0F3A5F !important; }}
+[data-testid="stSidebar"] [data-baseweb="select"] svg {{ fill: #1E6FA8 !important; }}
 [data-testid="stSidebar"] [role="radiogroup"] {{ gap: 4px; }}
 [data-testid="stSidebar"] [role="radiogroup"] label {{ padding: 9px 12px; border-radius: 12px; width: 100%; transition: background .15s; }}
 [data-testid="stSidebar"] [role="radiogroup"] label > div:first-child {{ display: none; }}
@@ -105,11 +109,20 @@ section.main [data-testid="stMarkdownContainer"] p, section.main [data-testid="s
   background: linear-gradient(90deg, rgba(242,181,68,.22), rgba(242,181,68,.04)); box-shadow: inset 3px 0 0 {GOLD}; }}
 [data-testid="stSidebar"] [role="radiogroup"] label:has(input:checked) p {{ color: #fff !important; font-weight: 700; }}
 [data-testid="stSidebar"] [data-testid="stExpander"] {{ background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.12); border-radius: 16px; }}
-[data-testid="stSidebar"] [data-testid="stExpander"] summary:hover {{ background: transparent; }}
+[data-testid="stSidebar"] [data-testid="stExpander"] details, [data-testid="stSidebar"] [data-testid="stExpander"] summary,
+[data-testid="stSidebar"] [data-testid="stExpander"] summary:hover {{ background: transparent !important; }}
+[data-testid="stSidebar"] [data-testid="stExpander"] summary, [data-testid="stSidebar"] [data-testid="stExpander"] summary * {{
+  color: #FFFFFF !important; fill: #FFFFFF; font-weight: 600; }}
 [data-testid="stSidebar"] hr {{ border-color: rgba(255,255,255,.12); }}
 [data-testid="stSidebar"] .stButton > button {{ background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.14); box-shadow: none; min-height: 40px; }}
 [data-testid="stSidebar"] .stButton > button:hover {{ background: rgba(242,181,68,.18); border-color: {GOLD}; }}
 [data-testid="stSidebar"] code {{ background: rgba(242,181,68,.18); color: #FFD98A; }}
+/* demo phone: the one-time code is shown as a white "SMS" card with dark text */
+[data-testid="stSidebar"] [data-testid="stCode"] pre, [data-testid="stSidebar"] pre {{
+  background: #FFFFFF !important; border: 2px solid {GOLD}; border-radius: 12px !important; }}
+[data-testid="stSidebar"] pre code, [data-testid="stSidebar"] pre code * {{
+  color: {NAVY} !important; background: transparent !important; font-weight: 600; font-size: 13px; }}
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] strong {{ color: #FFFFFF !important; }}
 
 .hdg-brand {{ display:flex; gap:12px; align-items:center; margin: 4px 0 18px; }}
 .hdg-brand b {{ font-weight:700; font-size:21px; color:#fff !important; display:block; line-height:1.15; }}
